@@ -13,9 +13,12 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname, 'public')));
 
-// Ensure uploads directory exists
+// FIXED: Render-compatible static file serving
+app.use(express.static(path.join(__dirname, 'public')));
+app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
+
+// FIXED: Render-compatible uploads directory
 const uploadsDir = path.join(__dirname, 'public', 'uploads');
 if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true });
@@ -46,13 +49,13 @@ const upload = multer({
     }
 });
 
-// MySQL Database Connection
-// MySQL Database Connection
+// FIXED: Render MySQL Database Configuration
 const dbConfig = {
-    host: 'localhost',
-    user: 'root',
-    password: 'Comped@12345', // Change back to empty for XAMPP
-    database: 'ugwunagbo'
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || 'Comped@12345',
+    database: process.env.DB_NAME || 'ugwunagbo',
+    port: process.env.DB_PORT || 3306
 };
 
 // Create connection pool
@@ -129,8 +132,8 @@ async function initializeDatabase() {
         console.log('✅ Database initialized successfully');
         
     } catch (error) {
-        console.log('⚠️  Database warning:', error.message);
-        console.log('💡 The website will still run, but admin features may not work');
+        console.log('❌ Database connection error:', error.message);
+        console.log('💡 The website will still run, but admin features may not work without database');
     } finally {
         if (connection) connection.release();
     }
@@ -142,7 +145,14 @@ async function initializeDatabase() {
 app.get('/api/leaders', async (req, res) => {
     try {
         const [rows] = await pool.execute('SELECT * FROM leaders ORDER BY id DESC');
-        res.json(rows);
+        
+        // FIXED: Ensure image URLs are absolute for Render
+        const leadersWithAbsoluteUrls = rows.map(leader => ({
+            ...leader,
+            image: leader.image ? (leader.image.startsWith('http') ? leader.image : `${req.protocol}://${req.get('host')}${leader.image}`) : null
+        }));
+        
+        res.json(leadersWithAbsoluteUrls);
     } catch (error) {
         console.error('Error fetching leaders:', error);
         res.status(500).json({ error: 'Failed to fetch leaders' });
@@ -164,7 +174,11 @@ app.post('/api/leaders', upload.single('image'), async (req, res) => {
             [name, position, bio, imagePath, email, phone, twitter, facebook, linkedin]
         );
         
-        res.json({ id: result.insertId, message: 'Leader added successfully' });
+        res.json({ 
+            id: result.insertId, 
+            message: 'Leader added successfully',
+            imageUrl: imagePath ? `${req.protocol}://${req.get('host')}${imagePath}` : null
+        });
     } catch (error) {
         console.error('Error adding leader:', error);
         res.status(500).json({ error: 'Failed to add leader' });
@@ -207,7 +221,10 @@ app.put('/api/leaders/:id', upload.single('image'), async (req, res) => {
             );
         }
         
-        res.json({ message: 'Leader updated successfully' });
+        res.json({ 
+            message: 'Leader updated successfully',
+            imageUrl: imagePath ? `${req.protocol}://${req.get('host')}${imagePath}` : null
+        });
     } catch (error) {
         console.error('Error updating leader:', error);
         res.status(500).json({ error: 'Failed to update leader' });
@@ -244,7 +261,14 @@ app.delete('/api/leaders/:id', async (req, res) => {
 app.get('/api/news', async (req, res) => {
     try {
         const [rows] = await pool.execute('SELECT * FROM news ORDER BY date DESC');
-        res.json(rows);
+        
+        // FIXED: Ensure image URLs are absolute for Render
+        const newsWithAbsoluteUrls = rows.map(newsItem => ({
+            ...newsItem,
+            image: newsItem.image ? (newsItem.image.startsWith('http') ? newsItem.image : `${req.protocol}://${req.get('host')}${newsItem.image}`) : null
+        }));
+        
+        res.json(newsWithAbsoluteUrls);
     } catch (error) {
         console.error('Error fetching news:', error);
         res.status(500).json({ error: 'Failed to fetch news' });
@@ -266,7 +290,11 @@ app.post('/api/news', upload.single('image'), async (req, res) => {
             [title, content, imagePath, date]
         );
         
-        res.json({ id: result.insertId, message: 'News added successfully' });
+        res.json({ 
+            id: result.insertId, 
+            message: 'News added successfully',
+            imageUrl: imagePath ? `${req.protocol}://${req.get('host')}${imagePath}` : null
+        });
     } catch (error) {
         console.error('Error adding news:', error);
         res.status(500).json({ error: 'Failed to add news' });
@@ -309,7 +337,10 @@ app.put('/api/news/:id', upload.single('image'), async (req, res) => {
             );
         }
         
-        res.json({ message: 'News updated successfully' });
+        res.json({ 
+            message: 'News updated successfully',
+            imageUrl: imagePath ? `${req.protocol}://${req.get('host')}${imagePath}` : null
+        });
     } catch (error) {
         console.error('Error updating news:', error);
         res.status(500).json({ error: 'Failed to update news' });
@@ -396,10 +427,16 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+// Handle all other routes - serve React app
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
 // Initialize database and start server
 initializeDatabase().then(() => {
     app.listen(PORT, () => {
         console.log(`🚀 Server running on http://localhost:${PORT}`);
         console.log(`📁 Uploads directory: ${uploadsDir}`);
+        console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
     });
 });

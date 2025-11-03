@@ -1,4 +1,6 @@
 // Configuration
+
+// Configuration - UPDATED FOR RENDER
 const CONFIG = {
     apiBaseUrl: window.location.origin,
     isProduction: true
