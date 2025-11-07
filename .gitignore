@@ -81,3 +81,4 @@ Thumbs.db
 
 # Uploads directory (if you want to exclude uploaded files from version control)
 public/uploads/
+.vercel

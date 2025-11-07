@@ -9,9 +9,17 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const { body, validationResult } = require("express-validator");
 require("dotenv").config();
+const cloudinary = require('cloudinary').v2;
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Configure Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
 
 // Security Middleware
 app.use(helmet());
@@ -21,12 +29,6 @@ app.use(cors());
 app.use(bodyParser.json({ limit: "10mb" }));
 app.use(bodyParser.urlencoded({ extended: true, limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
-
-// Ensure uploads directory exists
-const uploadsDir = path.join(__dirname, "public", "uploads");
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
 
 // Enhanced file filter for security
 const fileFilter = function (req, file, cb) {
@@ -53,37 +55,18 @@ const fileFilter = function (req, file, cb) {
   }
 };
 
-// Check file extension
-const checkFileExtension = (filename) => {
-  const allowedExtensions = [
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".gif",
-    ".webp",
-    ".mp4",
-    ".mpeg",
-    ".mov",
-  ];
-  const ext = path.extname(filename).toLowerCase();
-  return allowedExtensions.includes(ext);
-};
-
-// Configure multer for file uploads
+// Configure multer for file uploads (temporary storage for Cloudinary)
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
+    const uploadsDir = path.join(__dirname, "temp_uploads");
+    if (!fs.existsSync(uploadsDir)) {
+      fs.mkdirSync(uploadsDir, { recursive: true });
+    }
     cb(null, uploadsDir);
   },
   filename: function (req, file, cb) {
     const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    const filename =
-      file.fieldname + "-" + uniqueSuffix + path.extname(file.originalname);
-
-    // Additional security check
-    if (!checkFileExtension(filename)) {
-      return cb(new Error("Invalid file extension"), false);
-    }
-
+    const filename = file.fieldname + "-" + uniqueSuffix + path.extname(file.originalname);
     cb(null, filename);
   },
 });
@@ -116,59 +99,6 @@ const pool = mysql.createPool({
   queueLimit: 0,
   enableKeepAlive: true,
   keepAliveInitialDelay: 0,
-});
-
-// Test database connection on startup
-async function testDatabaseConnection() {
-  try {
-    const connection = await pool.getConnection();
-    console.log("✅ Database connection successful!");
-
-    // Test support_requests table
-    const [tables] = await connection.execute(
-      `
-            SELECT TABLE_NAME 
-            FROM information_schema.tables 
-            WHERE table_schema = ? AND TABLE_NAME = 'support_requests'
-        `,
-      [dbConfig.database]
-    );
-
-    if (tables.length === 0) {
-      console.log("⚠️ support_requests table not found, creating it...");
-      await connection.execute(`
-                CREATE TABLE IF NOT EXISTS support_requests (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    fullName VARCHAR(255) NOT NULL,
-                    email VARCHAR(255) NOT NULL,
-                    phone VARCHAR(50),
-                    village VARCHAR(255) NOT NULL,
-                    issueType VARCHAR(100) NOT NULL,
-                    priority VARCHAR(50) NOT NULL,
-                    subject VARCHAR(500) NOT NULL,
-                    description TEXT NOT NULL,
-                    suggestions TEXT,
-                    date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    status VARCHAR(50) DEFAULT 'pending'
-                )
-            `);
-      console.log("✅ support_requests table created");
-    }
-
-    connection.release();
-    return true;
-  } catch (error) {
-    console.error("❌ Database connection failed:", error.message);
-    return false;
-  }
-}
-
-// Database connection error handling
-pool.on("error", (err) => {
-  console.error("Database pool error:", err);
-  if (err.code === "PROTOCOL_CONNECTION_LOST") {
-    console.log("Database connection was closed.");
-  }
 });
 
 // Initialize database with retry logic
@@ -342,7 +272,6 @@ const validateContact = [
   body("message").notEmpty().trim().escape().isLength({ min: 10 }),
 ];
 
-// FIXED: Updated validateSupport to handle optional fields properly
 const validateSupport = [
   body("fullName").notEmpty().trim().escape().isLength({ min: 2, max: 255 }),
   body("email").isEmail().normalizeEmail(),
@@ -387,12 +316,16 @@ app.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { title, category, description, date, time, location, organizer } =
-        req.body;
+      const { title, category, description, date, time, location, organizer } = req.body;
 
-      let imagePath = null;
+      let imageUrl = null;
       if (req.file) {
-        imagePath = "/uploads/" + req.file.filename;
+        const result = await cloudinary.uploader.upload(req.file.path, {
+          folder: 'ugwunagbo/events'
+        });
+        imageUrl = result.secure_url;
+        // Clean up temporary file
+        fs.unlinkSync(req.file.path);
       }
 
       const [result] = await pool.execute(
@@ -405,7 +338,7 @@ app.post(
           time,
           location.trim(),
           organizer?.trim(),
-          imagePath,
+          imageUrl,
         ]
       );
 
@@ -437,39 +370,23 @@ app.put(
       }
 
       const { id } = req.params;
-      const { title, category, description, date, time, location, organizer } =
-        req.body;
+      const { title, category, description, date, time, location, organizer } = req.body;
 
       if (!id || isNaN(id)) {
         return res.status(400).json({ error: "Valid event ID is required" });
       }
 
-      let imagePath = null;
+      let imageUrl = null;
       if (req.file) {
-        imagePath = "/uploads/" + req.file.filename;
-
-        // Delete old image if exists
-        try {
-          const [oldEvent] = await pool.execute(
-            "SELECT image FROM events WHERE id = ?",
-            [id]
-          );
-          if (oldEvent[0] && oldEvent[0].image) {
-            const oldImagePath = path.join(
-              __dirname,
-              "public",
-              oldEvent[0].image
-            );
-            if (fs.existsSync(oldImagePath)) {
-              fs.unlinkSync(oldImagePath);
-            }
-          }
-        } catch (deleteError) {
-          console.log("Could not delete old image:", deleteError.message);
-        }
+        const result = await cloudinary.uploader.upload(req.file.path, {
+          folder: 'ugwunagbo/events'
+        });
+        imageUrl = result.secure_url;
+        // Clean up temporary file
+        fs.unlinkSync(req.file.path);
       }
 
-      if (imagePath) {
+      if (imageUrl) {
         await pool.execute(
           "UPDATE events SET title=?, category=?, description=?, date=?, time=?, location=?, organizer=?, image=? WHERE id=?",
           [
@@ -480,7 +397,7 @@ app.put(
             time,
             location.trim(),
             organizer?.trim(),
-            imagePath,
+            imageUrl,
             id,
           ]
         );
@@ -516,22 +433,6 @@ app.delete("/api/events/:id", async (req, res) => {
       return res.status(400).json({ error: "Valid event ID is required" });
     }
 
-    // Delete associated image file
-    try {
-      const [event] = await pool.execute(
-        "SELECT image FROM events WHERE id = ?",
-        [id]
-      );
-      if (event[0] && event[0].image) {
-        const imagePath = path.join(__dirname, "public", event[0].image);
-        if (fs.existsSync(imagePath)) {
-          fs.unlinkSync(imagePath);
-        }
-      }
-    } catch (deleteError) {
-      console.log("Could not delete image file:", deleteError.message);
-    }
-
     await pool.execute("DELETE FROM events WHERE id=?", [id]);
     res.json({ message: "Event deleted successfully" });
   } catch (error) {
@@ -565,45 +466,32 @@ app.put("/api/governor", upload.single("image"), async (req, res) => {
       return res.status(400).json({ error: "Name is required" });
     }
 
-    let imagePath = null;
+    let imageUrl = null;
     if (req.file) {
-      imagePath = "/uploads/" + req.file.filename;
+      const result = await cloudinary.uploader.upload(req.file.path, {
+        folder: 'ugwunagbo/governor'
+      });
+      imageUrl = result.secure_url;
+      // Clean up temporary file
+      fs.unlinkSync(req.file.path);
     }
 
     // Check if governor exists
     const [existing] = await pool.execute("SELECT * FROM governor");
 
     if (existing.length > 0) {
-      // Update existing governor
-      if (imagePath) {
-        // Delete old image if exists
-        try {
-          if (existing[0].image) {
-            const oldImagePath = path.join(
-              __dirname,
-              "public",
-              existing[0].image
-            );
-            if (fs.existsSync(oldImagePath)) {
-              fs.unlinkSync(oldImagePath);
-            }
-          }
-        } catch (deleteError) {
-          console.log("Could not delete old image:", deleteError.message);
-        }
-
+      if (imageUrl) {
         await pool.execute("UPDATE governor SET name=?, image=?", [
           name.trim(),
-          imagePath,
+          imageUrl,
         ]);
       } else {
         await pool.execute("UPDATE governor SET name=?", [name.trim()]);
       }
     } else {
-      // Insert new governor
       await pool.execute("INSERT INTO governor (name, image) VALUES (?, ?)", [
         name.trim(),
-        imagePath,
+        imageUrl,
       ]);
     }
 
@@ -639,37 +527,26 @@ app.put("/api/video", upload.single("video"), async (req, res) => {
       return res.status(400).json({ error: "Title is required" });
     }
 
-    let videoPath = null;
+    let videoUrl = null;
     if (req.file) {
-      videoPath = "/uploads/" + req.file.filename;
+      const result = await cloudinary.uploader.upload(req.file.path, {
+        folder: 'ugwunagbo/videos',
+        resource_type: 'video'
+      });
+      videoUrl = result.secure_url;
+      // Clean up temporary file
+      fs.unlinkSync(req.file.path);
     }
 
     // Check if video exists
     const [existing] = await pool.execute("SELECT * FROM video");
 
     if (existing.length > 0) {
-      // Update existing video
-      if (videoPath) {
-        // Delete old video if exists
-        try {
-          if (existing[0].video) {
-            const oldVideoPath = path.join(
-              __dirname,
-              "public",
-              existing[0].video
-            );
-            if (fs.existsSync(oldVideoPath)) {
-              fs.unlinkSync(oldVideoPath);
-            }
-          }
-        } catch (deleteError) {
-          console.log("Could not delete old video:", deleteError.message);
-        }
-
+      if (videoUrl) {
         await pool.execute("UPDATE video SET title=?, description=?, video=?", [
           title.trim(),
           description?.trim(),
-          videoPath,
+          videoUrl,
         ]);
       } else {
         await pool.execute("UPDATE video SET title=?, description=?", [
@@ -678,10 +555,9 @@ app.put("/api/video", upload.single("video"), async (req, res) => {
         ]);
       }
     } else {
-      // Insert new video
       await pool.execute(
         "INSERT INTO video (title, description, video) VALUES (?, ?, ?)",
-        [title.trim(), description?.trim(), videoPath]
+        [title.trim(), description?.trim(), videoUrl]
       );
     }
 
@@ -692,81 +568,13 @@ app.put("/api/video", upload.single("video"), async (req, res) => {
   }
 });
 
-// Villages DELETE endpoint - ENHANCED VERSION
-app.delete("/api/villages/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    console.log("🚨 DELETE VILLAGE REQUEST - ID:", id);
-
-    if (!id || isNaN(id)) {
-      console.log("❌ Invalid village ID:", id);
-      return res.status(400).json({ 
-        success: false,
-        error: "Valid village ID is required" 
-      });
-    }
-
-    // First, check if the village exists
-    const [existingVillage] = await pool.execute(
-      "SELECT * FROM villages WHERE id = ?", 
-      [id]
-    );
-
-    console.log("🔍 Village found:", existingVillage[0]);
-
-    if (existingVillage.length === 0) {
-      console.log("❌ Village not found with ID:", id);
-      return res.status(404).json({ 
-        success: false,
-        error: "Village not found" 
-      });
-    }
-
-    // Delete the village
-    const [result] = await pool.execute(
-      "DELETE FROM villages WHERE id = ?", 
-      [id]
-    );
-
-    console.log("✅ DELETE result:", result);
-
-    if (result.affectedRows === 0) {
-      console.log("❌ No rows affected - village not deleted");
-      return res.status(404).json({ 
-        success: false,
-        error: "Village not found or already deleted" 
-      });
-    }
-
-    console.log("✅ Village deleted successfully, affected rows:", result.affectedRows);
-    
-    res.json({ 
-      success: true,
-      message: "Village deleted successfully",
-      deletedId: parseInt(id)
-    });
-    
-  } catch (error) {
-    console.error("❌ SERVER ERROR deleting village:", error);
-    res.status(500).json({ 
-      success: false,
-      error: "Failed to delete village",
-      details: error.message 
-    });
-  }
-});
-
 // Villages Routes
 app.get("/api/villages", async (req, res) => {
   try {
     console.log("📋 Fetching villages...");
-    
-    // Only get villages that are not soft-deleted
     const [rows] = await pool.execute(
       "SELECT * FROM villages WHERE is_deleted = 0 ORDER BY name ASC"
     );
-    
     console.log(`✅ Found ${rows.length} active villages`);
     res.json(rows);
   } catch (error) {
@@ -808,6 +616,68 @@ app.post(
   }
 );
 
+app.delete("/api/villages/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    console.log("🚨 DELETE VILLAGE REQUEST - ID:", id);
+
+    if (!id || isNaN(id)) {
+      console.log("❌ Invalid village ID:", id);
+      return res.status(400).json({ 
+        success: false,
+        error: "Valid village ID is required" 
+      });
+    }
+
+    const [existingVillage] = await pool.execute(
+      "SELECT * FROM villages WHERE id = ?", 
+      [id]
+    );
+
+    console.log("🔍 Village found:", existingVillage[0]);
+
+    if (existingVillage.length === 0) {
+      console.log("❌ Village not found with ID:", id);
+      return res.status(404).json({ 
+        success: false,
+        error: "Village not found" 
+      });
+    }
+
+    const [result] = await pool.execute(
+      "DELETE FROM villages WHERE id = ?", 
+      [id]
+    );
+
+    console.log("✅ DELETE result:", result);
+
+    if (result.affectedRows === 0) {
+      console.log("❌ No rows affected - village not deleted");
+      return res.status(404).json({ 
+        success: false,
+        error: "Village not found or already deleted" 
+      });
+    }
+
+    console.log("✅ Village deleted successfully, affected rows:", result.affectedRows);
+    
+    res.json({ 
+      success: true,
+      message: "Village deleted successfully",
+      deletedId: parseInt(id)
+    });
+    
+  } catch (error) {
+    console.error("❌ SERVER ERROR deleting village:", error);
+    res.status(500).json({ 
+      success: false,
+      error: "Failed to delete village",
+      details: error.message 
+    });
+  }
+});
+
 // Leaders Routes
 app.get("/api/leaders", async (req, res) => {
   try {
@@ -839,12 +709,16 @@ app.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { name, position, bio, email, phone, twitter, facebook, linkedin } =
-        req.body;
+      const { name, position, bio, email, phone, twitter, facebook, linkedin } = req.body;
 
-      let imagePath = null;
+      let imageUrl = null;
       if (req.file) {
-        imagePath = "/uploads/" + req.file.filename;
+        const result = await cloudinary.uploader.upload(req.file.path, {
+          folder: 'ugwunagbo/leaders'
+        });
+        imageUrl = result.secure_url;
+        // Clean up temporary file
+        fs.unlinkSync(req.file.path);
       }
 
       const [result] = await pool.execute(
@@ -853,7 +727,7 @@ app.post(
           name.trim(),
           position.trim(),
           bio.trim(),
-          imagePath,
+          imageUrl,
           email,
           phone,
           twitter,
@@ -891,46 +765,30 @@ app.put(
       }
 
       const { id } = req.params;
-      const { name, position, bio, email, phone, twitter, facebook, linkedin } =
-        req.body;
+      const { name, position, bio, email, phone, twitter, facebook, linkedin } = req.body;
 
       if (!id || isNaN(id)) {
         return res.status(400).json({ error: "Valid leader ID is required" });
       }
 
-      let imagePath = null;
+      let imageUrl = null;
       if (req.file) {
-        imagePath = "/uploads/" + req.file.filename;
-
-        // Delete old image if exists
-        try {
-          const [oldLeader] = await pool.execute(
-            "SELECT image FROM leaders WHERE id = ?",
-            [id]
-          );
-          if (oldLeader[0] && oldLeader[0].image) {
-            const oldImagePath = path.join(
-              __dirname,
-              "public",
-              oldLeader[0].image
-            );
-            if (fs.existsSync(oldImagePath)) {
-              fs.unlinkSync(oldImagePath);
-            }
-          }
-        } catch (deleteError) {
-          console.log("Could not delete old image:", deleteError.message);
-        }
+        const result = await cloudinary.uploader.upload(req.file.path, {
+          folder: 'ugwunagbo/leaders'
+        });
+        imageUrl = result.secure_url;
+        // Clean up temporary file
+        fs.unlinkSync(req.file.path);
       }
 
-      if (imagePath) {
+      if (imageUrl) {
         await pool.execute(
           "UPDATE leaders SET name=?, position=?, bio=?, image=?, email=?, phone=?, twitter=?, facebook=?, linkedin=? WHERE id=?",
           [
             name.trim(),
             position.trim(),
             bio.trim(),
-            imagePath,
+            imageUrl,
             email,
             phone,
             twitter,
@@ -972,22 +830,6 @@ app.delete("/api/leaders/:id", async (req, res) => {
       return res.status(400).json({ error: "Valid leader ID is required" });
     }
 
-    // Delete associated image file
-    try {
-      const [leader] = await pool.execute(
-        "SELECT image FROM leaders WHERE id = ?",
-        [id]
-      );
-      if (leader[0] && leader[0].image) {
-        const imagePath = path.join(__dirname, "public", leader[0].image);
-        if (fs.existsSync(imagePath)) {
-          fs.unlinkSync(imagePath);
-        }
-      }
-    } catch (deleteError) {
-      console.log("Could not delete image file:", deleteError.message);
-    }
-
     await pool.execute("DELETE FROM leaders WHERE id=?", [id]);
     res.json({ message: "Leader deleted successfully" });
   } catch (error) {
@@ -1024,14 +866,19 @@ app.post(
 
       const { title, content, date } = req.body;
 
-      let imagePath = null;
+      let imageUrl = null;
       if (req.file) {
-        imagePath = "/uploads/" + req.file.filename;
+        const result = await cloudinary.uploader.upload(req.file.path, {
+          folder: 'ugwunagbo/news'
+        });
+        imageUrl = result.secure_url;
+        // Clean up temporary file
+        fs.unlinkSync(req.file.path);
       }
 
       const [result] = await pool.execute(
         "INSERT INTO news (title, content, image, date) VALUES (?, ?, ?, ?)",
-        [title.trim(), content.trim(), imagePath, date]
+        [title.trim(), content.trim(), imageUrl, date]
       );
 
       res.json({ id: result.insertId, message: "News added successfully" });
@@ -1064,35 +911,20 @@ app.put(
         return res.status(400).json({ error: "Valid news ID is required" });
       }
 
-      let imagePath = null;
+      let imageUrl = null;
       if (req.file) {
-        imagePath = "/uploads/" + req.file.filename;
-
-        // Delete old image if exists
-        try {
-          const [oldNews] = await pool.execute(
-            "SELECT image FROM news WHERE id = ?",
-            [id]
-          );
-          if (oldNews[0] && oldNews[0].image) {
-            const oldImagePath = path.join(
-              __dirname,
-              "public",
-              oldNews[0].image
-            );
-            if (fs.existsSync(oldImagePath)) {
-              fs.unlinkSync(oldImagePath);
-            }
-          }
-        } catch (deleteError) {
-          console.log("Could not delete old image:", deleteError.message);
-        }
+        const result = await cloudinary.uploader.upload(req.file.path, {
+          folder: 'ugwunagbo/news'
+        });
+        imageUrl = result.secure_url;
+        // Clean up temporary file
+        fs.unlinkSync(req.file.path);
       }
 
-      if (imagePath) {
+      if (imageUrl) {
         await pool.execute(
           "UPDATE news SET title=?, content=?, image=?, date=? WHERE id=?",
-          [title.trim(), content.trim(), imagePath, date, id]
+          [title.trim(), content.trim(), imageUrl, date, id]
         );
       } else {
         await pool.execute(
@@ -1115,22 +947,6 @@ app.delete("/api/news/:id", async (req, res) => {
 
     if (!id || isNaN(id)) {
       return res.status(400).json({ error: "Valid news ID is required" });
-    }
-
-    // Delete associated image file
-    try {
-      const [newsItem] = await pool.execute(
-        "SELECT image FROM news WHERE id = ?",
-        [id]
-      );
-      if (newsItem[0] && newsItem[0].image) {
-        const imagePath = path.join(__dirname, "public", newsItem[0].image);
-        if (fs.existsSync(imagePath)) {
-          fs.unlinkSync(imagePath);
-        }
-      }
-    } catch (deleteError) {
-      console.log("Could not delete image file:", deleteError.message);
     }
 
     await pool.execute("DELETE FROM news WHERE id=?", [id]);
@@ -1178,7 +994,7 @@ app.post("/api/contacts", validateContact, async (req, res) => {
   }
 });
 
-// Support API Routes - ENHANCED VERSION
+// Support API Routes
 app.get("/api/support", async (req, res) => {
   try {
     console.log("📦 Fetching support requests from database...");
@@ -1420,7 +1236,7 @@ app.use("*", (req, res) => {
 initializeDatabaseWithRetry().then(() => {
   app.listen(PORT, () => {
     console.log(`🚀 Server running on http://localhost:${PORT}`);
-    console.log(`📁 Uploads directory: ${uploadsDir}`);
     console.log(`🔐 Admin login: username: ${process.env.ADMIN_USERNAME || 'admin'}, password: ${process.env.ADMIN_PASSWORD ? '***' : 'admin123'}`);
+    console.log(`☁️  Cloudinary configured for folder: ugwunagbo`);
   });
 });
